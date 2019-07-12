@@ -56,7 +56,7 @@ public class PubsubToBigQueryTest {
   @Test
   public void testPubsubToBigQueryE2E() throws Exception {
     // Test input
-    final String payload = "{\"ticker\": \"GOOGL\", \"price\": 1006.94}";
+    final String payload = "{\"ticker\": \"GOOGL\", \"price\": 1006.94, \"account_id\":\"7048515\", \"stream_id\":\"8593c9a2-1485-4f13-8779-525297ec091d\",\"event_name\":\"stream_start\"}";
     final PubsubMessage message =
         new PubsubMessage(payload.getBytes(), ImmutableMap.of("id", "123", "type", "custom_event"));
 

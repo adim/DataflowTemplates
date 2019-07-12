@@ -19,6 +19,7 @@ package com.google.cloud.teleport.templates.common;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.auto.value.AutoValue;
+import com.google.cloud.bigtable.hbase.BigtableConfiguration;
 import com.google.cloud.teleport.templates.common.DatastoreConverters.CheckNoKey;
 import com.google.cloud.teleport.values.FailsafeElement;
 import com.google.common.base.Throwables;
@@ -55,13 +56,25 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.*;
+import org.apache.hadoop.hbase.filter.CompareFilter;
+import org.apache.hadoop.hbase.filter.Filter;
+import org.apache.hadoop.hbase.filter.FilterList;
+import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Common transforms for Teleport BigQueryIO. */
 public class BigQueryConverters {
 
   public static final int MAX_STRING_SIZE_BYTES = 1500;
+  public static Connection BIG_TABLE_CONNECTION = null;
+
   public static final int TRUNCATE_STRING_SIZE_CHARS = 401;
   public static final String TRUNCATE_STRING_MESSAGE = "First %d characters of row %s";
+  public static final String PROJECT_ID = "YOUR-PROJECT-ID";
   public static final List<String> SUPPORTED_KEY_NAME_TYPES =
       Arrays.asList(
           "STRING",
@@ -75,6 +88,7 @@ public class BigQueryConverters {
           "DATE",
           "TIME",
           "DATETIME");
+  private static final Logger LOG = LoggerFactory.getLogger(BigQueryConverters.class);
 
   /** Options for reading data from BigQuery. */
   public interface BigQueryReadOptions extends PipelineOptions {
@@ -146,6 +160,13 @@ public class BigQueryConverters {
 
     @Override
     public PCollectionTuple expand(PCollection<FailsafeElement<T, String>> failsafeElements) {
+      try {
+        if(BigQueryConverters.BIG_TABLE_CONNECTION == null || BigQueryConverters.BIG_TABLE_CONNECTION.isClosed()) {
+          BigQueryConverters.BIG_TABLE_CONNECTION = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
+        }
+      }catch (Exception e){
+        LOG.error("Error connect to BigTable",e);
+      }
       return failsafeElements.apply(
           "JsonToTableRow",
           ParDo.of(
@@ -154,9 +175,58 @@ public class BigQueryConverters {
                     public void processElement(ProcessContext context) {
                       FailsafeElement<T, String> element = context.element();
                       String json = element.getPayload();
-
+                      //enrichment from big table
                       try {
                         TableRow row = convertJsonToTableRow(json);
+                        try {
+                          Object accountId = row.get("account_id");
+                          Object eventName = row.get("event_name");
+                          if(BigQueryConverters.BIG_TABLE_CONNECTION == null || BigQueryConverters.BIG_TABLE_CONNECTION.isClosed()) {
+                            BigQueryConverters.BIG_TABLE_CONNECTION = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
+                            //row.set("reason","RESTORE CONNECTION");
+                          }
+
+                          if (accountId != null) {
+                            Get get = new Get(Bytes.toBytes(accountId.toString()));
+                            Result res = BigQueryConverters.BIG_TABLE_CONNECTION.getTable(TableName.valueOf("accounts")).get(get);
+                            if (res.size() > 1) {
+                              byte[] valueBytes = res.getValue(Bytes.toBytes("user"), Bytes.toBytes("country"));
+                              String country = Bytes.toString(valueBytes);
+                              row.set("country", country);
+                            }
+                          }
+                          /* scan kill performance
+                          if(eventName!= null && (eventName.toString().equals("stream_start")||eventName.toString().equals("stream_end"))){
+                            Object streamId = row.get("stream_id");
+                            if(streamId!= null) {
+
+                              Filter filter = new SingleColumnValueFilter(Bytes
+                                      .toBytes("stream" ), Bytes.toBytes("stream_id" ), CompareFilter.CompareOp.EQUAL, Bytes
+                                      .toBytes(streamId.toString()));
+
+                              FilterList filterList = new FilterList();
+                              filterList.addFilter(filter);
+                              Scan scan = new Scan();
+                              scan.setFilter(filterList);
+
+                              ResultScanner scanner = BigQueryConverters.BIG_TABLE_CONNECTION.getTable(TableName.valueOf("accounts")).getScanner(scan);
+                              //int counter = 0;
+                              for (Result rowBigTable : scanner) {
+                                byte[] valueBytesType = rowBigTable.getValue(Bytes.toBytes("stream"), Bytes.toBytes("stream_type"));
+                                if(valueBytesType != null) {
+                                  row.set("account_id", Bytes.toString(rowBigTable.getRow()));
+                                  row.set("stream_type", Bytes.toString(valueBytesType));
+                                  break;
+                                }
+                                //counter++;
+                              }
+                            }
+                          }
+                           */
+                        }catch (Exception e) {
+                          //row.set("reason","BB:"+e.getMessage());
+                          LOG.error("Error get BigTable data",e);
+                        }
                         context.output(row);
                       } catch (Exception e) {
                         context.output(
