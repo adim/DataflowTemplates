@@ -19,10 +19,11 @@ package com.google.cloud.teleport.templates.common;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.auto.value.AutoValue;
-import com.google.cloud.bigtable.hbase.BigtableConfiguration;
+import com.google.cloud.bigtable.beam.AbstractCloudBigtableTableDoFn;
+import com.google.cloud.bigtable.beam.CloudBigtableConfiguration;
+import com.google.cloud.bigtable.beam.CloudBigtableTableConfiguration;
 import com.google.cloud.teleport.templates.common.DatastoreConverters.CheckNoKey;
 import com.google.cloud.teleport.values.FailsafeElement;
-import com.google.common.base.Throwables;
 import com.google.datastore.v1.Entity;
 import com.google.datastore.v1.Key;
 import com.google.datastore.v1.Key.PathElement;
@@ -58,10 +59,6 @@ import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
-import org.apache.hadoop.hbase.filter.CompareFilter;
-import org.apache.hadoop.hbase.filter.Filter;
-import org.apache.hadoop.hbase.filter.FilterList;
-import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,11 +67,12 @@ import org.slf4j.LoggerFactory;
 public class BigQueryConverters {
 
   public static final int MAX_STRING_SIZE_BYTES = 1500;
-  public static Connection BIG_TABLE_CONNECTION = null;
 
   public static final int TRUNCATE_STRING_SIZE_CHARS = 401;
   public static final String TRUNCATE_STRING_MESSAGE = "First %d characters of row %s";
+  //public static final String PROJECT_ID = "tangome-dev-001";
   public static final String PROJECT_ID = "YOUR-PROJECT-ID";
+  public static final String INSTANCE_ID = "INSTANCE_ID";
   public static final List<String> SUPPORTED_KEY_NAME_TYPES =
       Arrays.asList(
           "STRING",
@@ -106,6 +104,52 @@ public class BigQueryConverters {
     ValueProvider<String> getInvalidOutputPath();
 
     void setInvalidOutputPath(ValueProvider<String> value);
+  }
+
+  /**
+   * Query Bigtable for all of the keys that start with the given prefix.
+   */
+  static class ScanPrefixDoFn extends AbstractCloudBigtableTableDoFn<FailsafeElement<?, String>, TableRow> {
+    private final String tableId;
+
+    public ScanPrefixDoFn(CloudBigtableConfiguration config, String tableId) {
+      super(config);
+      this.tableId = tableId;
+    }
+
+    @ProcessElement
+    public void processElement(ProcessContext context) throws IOException {
+      FailsafeElement<?, String> element = context.element();
+      String json = element.getPayload();
+      //enrichment from big table
+      try {
+        TableRow row = convertJsonToTableRow(json);
+        try {
+          Object accountId = row.get("account_id");
+          Object eventName = row.get("event_name");
+          if (accountId != null) {
+            Get get = new Get(Bytes.toBytes(accountId.toString()));
+            Result res = getConnection().getTable(TableName.valueOf(tableId)).get(get);
+            if (res.size() > 1) {
+              byte[] valueBytes = res.getValue(Bytes.toBytes("user"), Bytes.toBytes("country"));
+              String country = Bytes.toString(valueBytes);
+              row.set("country", country);
+            }
+          }
+        } catch (Exception e) {
+          //row.set("reason","BB:"+e.getMessage());
+          LOG.error("Error get BigTable data", e);
+        }
+        context.output(row);
+      } catch (Exception e) {
+        //TODO: restore this line
+//        context.output(
+//                failureTag(),
+//                FailsafeElement.of(element)
+//                        .setErrorMessage(e.getMessage())
+//                        .setStacktrace(Throwables.getStackTraceAsString(e)));
+      }
+    }
   }
 
   /** Factory method for {@link JsonToTableRow}. */
@@ -160,83 +204,17 @@ public class BigQueryConverters {
 
     @Override
     public PCollectionTuple expand(PCollection<FailsafeElement<T, String>> failsafeElements) {
-      try {
-        if(BigQueryConverters.BIG_TABLE_CONNECTION == null || BigQueryConverters.BIG_TABLE_CONNECTION.isClosed()) {
-          BigQueryConverters.BIG_TABLE_CONNECTION = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
-        }
-      }catch (Exception e){
-        LOG.error("Error connect to BigTable",e);
-      }
+
+      CloudBigtableTableConfiguration bigtableConfig = new CloudBigtableTableConfiguration.Builder()
+              .withProjectId(PROJECT_ID)
+              .withInstanceId(INSTANCE_ID)
+              .withTableId("accounts")
+              .build();
+
       return failsafeElements.apply(
           "JsonToTableRow",
           ParDo.of(
-                  new DoFn<FailsafeElement<T, String>, TableRow>() {
-                    @ProcessElement
-                    public void processElement(ProcessContext context) {
-                      FailsafeElement<T, String> element = context.element();
-                      String json = element.getPayload();
-                      //enrichment from big table
-                      try {
-                        TableRow row = convertJsonToTableRow(json);
-                        try {
-                          Object accountId = row.get("account_id");
-                          Object eventName = row.get("event_name");
-                          if(BigQueryConverters.BIG_TABLE_CONNECTION == null || BigQueryConverters.BIG_TABLE_CONNECTION.isClosed()) {
-                            BigQueryConverters.BIG_TABLE_CONNECTION = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
-                            //row.set("reason","RESTORE CONNECTION");
-                          }
-
-                          if (accountId != null) {
-                            Get get = new Get(Bytes.toBytes(accountId.toString()));
-                            Result res = BigQueryConverters.BIG_TABLE_CONNECTION.getTable(TableName.valueOf("accounts")).get(get);
-                            if (res.size() > 1) {
-                              byte[] valueBytes = res.getValue(Bytes.toBytes("user"), Bytes.toBytes("country"));
-                              String country = Bytes.toString(valueBytes);
-                              row.set("country", country);
-                            }
-                          }
-                          /* scan kill performance
-                          if(eventName!= null && (eventName.toString().equals("stream_start")||eventName.toString().equals("stream_end"))){
-                            Object streamId = row.get("stream_id");
-                            if(streamId!= null) {
-
-                              Filter filter = new SingleColumnValueFilter(Bytes
-                                      .toBytes("stream" ), Bytes.toBytes("stream_id" ), CompareFilter.CompareOp.EQUAL, Bytes
-                                      .toBytes(streamId.toString()));
-
-                              FilterList filterList = new FilterList();
-                              filterList.addFilter(filter);
-                              Scan scan = new Scan();
-                              scan.setFilter(filterList);
-
-                              ResultScanner scanner = BigQueryConverters.BIG_TABLE_CONNECTION.getTable(TableName.valueOf("accounts")).getScanner(scan);
-                              //int counter = 0;
-                              for (Result rowBigTable : scanner) {
-                                byte[] valueBytesType = rowBigTable.getValue(Bytes.toBytes("stream"), Bytes.toBytes("stream_type"));
-                                if(valueBytesType != null) {
-                                  row.set("account_id", Bytes.toString(rowBigTable.getRow()));
-                                  row.set("stream_type", Bytes.toString(valueBytesType));
-                                  break;
-                                }
-                                //counter++;
-                              }
-                            }
-                          }
-                           */
-                        }catch (Exception e) {
-                          //row.set("reason","BB:"+e.getMessage());
-                          LOG.error("Error get BigTable data",e);
-                        }
-                        context.output(row);
-                      } catch (Exception e) {
-                        context.output(
-                            failureTag(),
-                            FailsafeElement.of(element)
-                                .setErrorMessage(e.getMessage())
-                                .setStacktrace(Throwables.getStackTraceAsString(e)));
-                      }
-                    }
-                  })
+                  new ScanPrefixDoFn(bigtableConfig,"accounts"))
               .withOutputTags(successTag(), TupleTagList.of(failureTag())));
     }
   }
