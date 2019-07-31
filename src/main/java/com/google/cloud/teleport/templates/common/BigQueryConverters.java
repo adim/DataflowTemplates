@@ -19,9 +19,8 @@ package com.google.cloud.teleport.templates.common;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.auto.value.AutoValue;
-import com.google.cloud.bigtable.beam.AbstractCloudBigtableTableDoFn;
-import com.google.cloud.bigtable.beam.CloudBigtableConfiguration;
 import com.google.cloud.bigtable.beam.CloudBigtableTableConfiguration;
+import com.google.cloud.bigtable.hbase.BigtableConfiguration;
 import com.google.cloud.teleport.templates.common.DatastoreConverters.CheckNoKey;
 import com.google.cloud.teleport.values.FailsafeElement;
 import com.google.datastore.v1.Entity;
@@ -71,8 +70,8 @@ public class BigQueryConverters {
   public static final int TRUNCATE_STRING_SIZE_CHARS = 401;
   public static final String TRUNCATE_STRING_MESSAGE = "First %d characters of row %s";
   //public static final String PROJECT_ID = "tangome-dev-001";
-  public static final String PROJECT_ID = "YOUR-PROJECT-ID";
-  public static final String INSTANCE_ID = "INSTANCE_ID";
+  public static final String PROJECT_ID = "tangome-production";
+  public static final String INSTANCE_ID = "epiphany-api";
   public static final List<String> SUPPORTED_KEY_NAME_TYPES =
       Arrays.asList(
           "STRING",
@@ -109,12 +108,34 @@ public class BigQueryConverters {
   /**
    * Query Bigtable for all of the keys that start with the given prefix.
    */
-  static class ScanPrefixDoFn extends AbstractCloudBigtableTableDoFn<FailsafeElement<?, String>, TableRow> {
+  static class ScanPrefixDoFn extends  DoFn<FailsafeElement<?, String>, TableRow> {
     private final String tableId;
+    static Object connectionLock = new Object();
+    static Connection bigtableConn = null;
+    static int numWorkers = 0;
 
-    public ScanPrefixDoFn(CloudBigtableConfiguration config, String tableId) {
-      super(config);
+    public ScanPrefixDoFn(String tableId) {
+      //super(config);
       this.tableId = tableId;
+    }
+
+    @Setup
+    public void initializeBigTableConnection() {
+
+      synchronized (connectionLock) {
+        if (numWorkers++ == 0) {
+          bigtableConn = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
+        }
+      }
+    }
+
+    @Teardown
+    public void closeBigTableConnection() throws IOException {
+      synchronized (connectionLock) {
+        if (--numWorkers == 0) {
+          bigtableConn.close();
+        }
+      }
     }
 
     @ProcessElement
@@ -129,7 +150,7 @@ public class BigQueryConverters {
           Object eventName = row.get("event_name");
           if (accountId != null) {
             Get get = new Get(Bytes.toBytes(accountId.toString()));
-            Result res = getConnection().getTable(TableName.valueOf(tableId)).get(get);
+            Result res = bigtableConn.getTable(TableName.valueOf("accounts")).get(get);
             if (res.size() > 1) {
               byte[] valueBytes = res.getValue(Bytes.toBytes("user"), Bytes.toBytes("country"));
               String country = Bytes.toString(valueBytes);
@@ -214,7 +235,7 @@ public class BigQueryConverters {
       return failsafeElements.apply(
           "JsonToTableRow",
           ParDo.of(
-                  new ScanPrefixDoFn(bigtableConfig,"accounts"))
+                  new ScanPrefixDoFn("accounts"))
               .withOutputTags(successTag(), TupleTagList.of(failureTag())));
     }
   }
