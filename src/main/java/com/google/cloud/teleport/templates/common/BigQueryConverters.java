@@ -16,11 +16,13 @@
 
 package com.google.cloud.teleport.templates.common;
 
+import com.google.api.services.bigquery.model.BigtableOptions;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.bigtable.beam.CloudBigtableTableConfiguration;
 import com.google.cloud.bigtable.hbase.BigtableConfiguration;
+import com.google.cloud.bigtable.hbase.BigtableOptionsFactory;
 import com.google.cloud.teleport.templates.common.DatastoreConverters.CheckNoKey;
 import com.google.cloud.teleport.values.FailsafeElement;
 import com.google.datastore.v1.Entity;
@@ -36,6 +38,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.coders.Coder.Context;
@@ -56,11 +59,13 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 
 /** Common transforms for Teleport BigQueryIO. */
 public class BigQueryConverters {
@@ -124,7 +129,18 @@ public class BigQueryConverters {
 
       synchronized (connectionLock) {
         if (numWorkers++ == 0) {
-          bigtableConn = BigtableConfiguration.connect(PROJECT_ID, "epiphany-api");
+          Configuration config = new Configuration(false);
+
+          config.set(BigtableOptionsFactory.BIGTABLE_USE_CACHED_DATA_CHANNEL_POOL, "true");
+          config.set(BigtableOptionsFactory.PROJECT_ID_KEY, PROJECT_ID);
+          config.set(BigtableOptionsFactory.INSTANCE_ID_KEY, "epiphany-api");
+
+          config.set(BigtableOptionsFactory.INITIAL_ELAPSED_BACKOFF_MILLIS_KEY,
+                  String.valueOf(TimeUnit.SECONDS.toMillis(5)));
+
+          config.set(BigtableOptionsFactory.MAX_ELAPSED_BACKOFF_MILLIS_KEY,
+                  String.valueOf(TimeUnit.MINUTES.toMillis(5)));
+          bigtableConn = BigtableConfiguration.connect(config);
         }
       }
     }
